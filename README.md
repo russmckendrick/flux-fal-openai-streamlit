@@ -1,1 +1,1 @@
-# Flux + Fal + Streamlit
+# Flux + Fal + OpenAI + Streamlit
