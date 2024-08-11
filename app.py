@@ -50,7 +50,9 @@ async def generate_image_with_fal(prompt, model, image_size, num_inference_steps
         }
     )
 
-    return handler
+    # Wait for the actual result instead of returning immediately
+    result = await handler.get()
+    return result
 
 def cycle_spinner_messages():
     messages = [
@@ -67,33 +69,80 @@ def cycle_spinner_messages():
     ]
     return itertools.cycle(messages)
 
+async def run_with_spinner(generation_coroutine, spinner_placeholder, message_cycle):
+    task = asyncio.create_task(generation_coroutine)
+    while not task.done():
+        spinner_placeholder.text(next(message_cycle))
+        await asyncio.sleep(3)
+    return await task
+
 def accept_tuned_prompt():
     st.session_state.user_prompt = st.session_state.tuned_prompt
     st.session_state.prompt_accepted = True
 
-def save_image(url, prompt):
-    response = requests.get(url)
-    if response.status_code == 200:
-        image = Image.open(BytesIO(response.content))
-        
-        # Create a filename using the current date and time
-        timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-        
-        # Sanitize the prompt to create a valid filename
-        safe_prompt = "".join(c for c in prompt if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_prompt = safe_prompt[:50]  # Limit the length of the prompt in the filename
-        
-        filename = f"{timestamp}_{safe_prompt}.png"
-        
-        # Ensure the images directory exists
-        images_folder = os.path.join(os.path.dirname(__file__), 'images')
-        os.makedirs(images_folder, exist_ok=True)
-        
-        # Save the image
-        full_path = os.path.join(images_folder, filename)
-        image.save(full_path)
-        return full_path
-    return None
+def format_markdown(prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance):
+    markdown = f"""# Image Generation Results
+
+## Prompt
+{prompt}
+
+## Generation Details
+- **Date and Time:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+- **Model:** {model}
+- **Seed:** {result.get('seed', 'Not specified')}
+- **NSFW Concepts Detected:** {result.get('has_nsfw_concepts', 'Not specified')}
+- **Image Size:** {image_size}
+- **Number of Inference Steps:** {num_inference_steps}
+- **Guidance Scale:** {guidance_scale}
+- **Safety Tolerance:** {safety_tolerance}
+
+## Image URL
+{result['images'][0]['url'] if 'images' in result and result['images'] else 'No image URL available'}
+
+"""
+    return markdown
+
+def save_image_and_markdown(url, prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance):
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            image = Image.open(BytesIO(response.content))
+            
+            # Create a filename using the current date and time
+            timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+            
+            # Sanitize the prompt to create a valid filename
+            safe_prompt = "".join(c for c in prompt if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_prompt = safe_prompt[:50]  # Limit the length of the prompt in the filename
+            
+            filename_base = f"{timestamp}_{safe_prompt}"
+            
+            # Ensure the images directory exists
+            images_folder = os.path.join(os.path.dirname(__file__), 'images')
+            os.makedirs(images_folder, exist_ok=True)
+            
+            # Save the image
+            image_filename = f"{filename_base}.png"
+            full_image_path = os.path.join(images_folder, image_filename)
+            image.save(full_image_path)
+            
+            # Save the Markdown data
+            markdown_filename = f"{filename_base}.md"
+            full_markdown_path = os.path.join(images_folder, markdown_filename)
+            markdown_content = format_markdown(prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance)
+            with open(full_markdown_path, 'w', encoding='utf-8') as md_file:
+                md_file.write(markdown_content)
+            
+            # Verify that the Markdown file is not empty
+            if os.path.getsize(full_markdown_path) == 0:
+                raise IOError("Markdown file is empty after writing")
+            
+            return full_image_path, full_markdown_path
+        else:
+            raise IOError(f"Failed to download image. Status code: {response.status_code}")
+    except Exception as e:
+        print(f"Error in save_image_and_markdown: {str(e)}")
+        return None, None
 
 def main():
     st.title("🤖 Image Generation with fal.ai & Flux")
@@ -199,50 +248,59 @@ def main():
         try:
             spinner_placeholder = st.empty()
             message_cycle = cycle_spinner_messages()
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Create a task for image generation with num_images hardcoded to 1
-            generation_task = loop.create_task(generate_image_with_fal(
-                user_prompt, model_options[selected_model],
-                image_size, num_inference_steps, guidance_scale, num_images=1, safety_tolerance=safety_tolerance
-            ))
 
-            # Update spinner message every 3 seconds until the task is complete
-            while not generation_task.done():
-                spinner_placeholder.text(next(message_cycle))
-                try:
-                    # Wait for 3 seconds or until the task completes, whichever comes first
-                    loop.run_until_complete(asyncio.wait_for(asyncio.shield(generation_task), timeout=3))
-                except asyncio.TimeoutError:
-                    # This is expected every 3 seconds if the task isn't done
-                    pass
+            async def generate_image_task():
+                return await generate_image_with_fal(
+                    user_prompt, model_options[selected_model],
+                    image_size, num_inference_steps, guidance_scale, num_images=1, safety_tolerance=safety_tolerance
+                )
 
-            # Get the result
-            handler = generation_task.result()
-            result = loop.run_until_complete(handler.get())
+            async def run_with_spinner(generation_coroutine):
+                task = asyncio.create_task(generation_coroutine)
+                while not task.done():
+                    spinner_placeholder.text(next(message_cycle))
+                    await asyncio.sleep(3)
+                return await task
+
+            # Run the asynchronous code within the synchronous Streamlit environment
+            result = asyncio.run(run_with_spinner(generate_image_task()))
 
             spinner_placeholder.empty()  # Clear the spinner
 
-            # Display the generated image and save it
+            # Display the generated image and save it along with Markdown data
             st.subheader("🖼️ Your Generated Masterpiece:")
             image_info = result['images'][0]  # We know there's only one image
             st.image(image_info['url'], caption="Generated Image", use_column_width=True)
-            
-            # Save the image
-            saved_path = save_image(image_info['url'], user_prompt)
-            if saved_path:
-                st.success(f"Image saved to {saved_path}")
-            else:
-                st.error("Failed to save the image")
-            
+
             # Display additional information
             st.write(f"🌱 Seed: {result['seed']}")
             st.write(f"🚫 NSFW concepts detected: {result['has_nsfw_concepts']}")
             
+            # Save the image and Markdown data
+            saved_image_path, saved_markdown_path = save_image_and_markdown(
+                image_info['url'], 
+                user_prompt, 
+                result, 
+                selected_model, 
+                image_size, 
+                num_inference_steps, 
+                guidance_scale, 
+                safety_tolerance
+            )
+            if saved_image_path and saved_markdown_path:
+                st.success(f"Image saved to {saved_image_path}")
+                st.success(f"Generation details saved to {saved_markdown_path}")
+                
+                # Display the content of the Markdown file
+                with open(saved_markdown_path, 'r', encoding='utf-8') as md_file:
+                    markdown_content = md_file.read()
+                st.markdown(markdown_content)
+            else:
+                st.error("Failed to save the image and/or generation details")
+            
         except Exception as e:
             st.error(f"⛔️ Error generating image: {str(e)}")
+            print(f"Error details: {e}")  # This will appear in your console/logs
 
 if __name__ == "__main__":
     main()
